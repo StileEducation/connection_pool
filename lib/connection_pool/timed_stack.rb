@@ -65,18 +65,41 @@ class ConnectionPool::TimedStack
     timeout = options.fetch :timeout, timeout
 
     deadline = current_time + timeout
-    @mutex.synchronize do
-      loop do
+    loop do
+      create_new = @mutex.synchronize do
+        # Try taking an existing connection
         raise ConnectionPool::PoolShuttingDownError if @shutdown_block
         return fetch_connection(options) if connection_stored?(options)
 
-        connection = try_create(options)
-        return connection if connection
+        # Check if we can make a new connection and if so, optimistically increment the
+        # connection count to lock that connection slot
+        unless @created == @max
+          @created += 1
+          true
+        end
+      end
 
+      # If we've decided to make a new connection
+      if create_new
+          begin
+              # Create a new connection without the mutex and yield it
+              return @create_block.call
+          rescue StandardError
+              # Something went wrong while making a connection; revert our optimistic increment to the
+              # connection counter
+              @mutex.synchronize { @created -= 1 }
+
+              # Then re-raise so that the caller can see the connection creation error
+              raise
+          end
+      end
+      # Wait for a connection to be returned to the pool
+      @mutex.synchronize do
         to_wait = deadline - current_time
         raise ConnectionPool::TimeoutError, "Waited #{timeout} sec, #{length}/#{@max} available" if to_wait <= 0
         @resource.wait(@mutex, to_wait)
       end
+
     end
   end
 
@@ -158,17 +181,4 @@ class ConnectionPool::TimedStack
     @que.push obj
   end
 
-  ##
-  # This is an extension point for TimedStack and is called with a mutex.
-  #
-  # This method must create a connection if and only if the total number of
-  # connections allowed has not been met.
-
-  def try_create(options = nil)
-    unless @created == @max
-      object = @create_block.call
-      @created += 1
-      object
-    end
-  end
 end
