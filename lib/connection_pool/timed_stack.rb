@@ -108,11 +108,21 @@ class ConnectionPool::TimedStack
         end
     end
 
-    ##
-    # Shuts down the TimedStack by passing each connection to +block+ and then
-    # removing it from the pool. Attempting to checkout a connection after
-    # shutdown will raise +ConnectionPool::PoolShuttingDownError+ unless
-    # +:reload+ is +true+.
+  ##
+  # Reaps connections that were checked in more than +idle_seconds+ ago.
+  def reap(idle_seconds, &block)
+    raise ArgumentError, "reap must receive a block" unless block
+    raise ArgumentError, "idle_seconds must be a number" unless idle_seconds.is_a?(Numeric)
+
+    @mutex.synchronize do
+      reap_start_time = current_time
+
+      reap_idle_connections(idle_seconds, reap_start_time, &block)
+    end
+  end
+
+  ##
+  # Returns +true+ if there are no available connections.
 
     def shutdown(reload: false, &block)
         raise ArgumentError, 'shutdown must receive a block' unless block
@@ -121,68 +131,95 @@ class ConnectionPool::TimedStack
             @shutdown_block = block
             @resource.broadcast
 
-            shutdown_connections
-            @shutdown_block = nil if reload
-        end
+  def length
+    @max - @created + @que.length
+  end
+
+  ##
+  # The number of connections created and available on the stack.
+  def idle
+    @que.length
+  end
+
+  private
+
+  def current_time
+    Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  end
+
+  ##
+  # This is an extension point for TimedStack and is called with a mutex.
+  #
+  # This method must returns true if a connection is available on the stack.
+
+  def connection_stored?(options = nil)
+    !@que.empty?
+  end
+
+  ##
+  # This is an extension point for TimedStack and is called with a mutex.
+  #
+  # This method must return a connection from the stack.
+
+  def fetch_connection(options = nil)
+    @que.pop&.first
+  end
+
+  ##
+  # This is an extension point for TimedStack and is called with a mutex.
+  #
+  # This method must shut down all connections on the stack.
+
+  def shutdown_connections(options = nil)
+    while connection_stored?(options)
+      conn = fetch_connection(options)
+      @shutdown_block.call(conn)
     end
 
-    ##
-    # Returns +true+ if there are no available connections.
+  ##
+  # This is an extension point for TimedStack and is called with a mutex.
+  #
+  # This method iterates over the connections in the stack and reaps the oldest idle connections one at a time until
+  # the first connection is not idle. This requires that the stack is kept in order of checked in time (oldest first).
 
-    def empty?
-        (@created - @que.length) >= @max
+  def reap_idle_connections(idle_seconds, reap_start_time, &reap_block)
+    while idle_connections?(idle_seconds, reap_start_time)
+      conn, _last_checked_out = @que.shift
+      reap_block.call(conn)
     end
+  end
 
-    ##
-    # The number of connections available on the stack.
+  ##
+  # This is an extension point for TimedStack and is called with a mutex.
+  #
+  # Returns true if the first connection in the stack has been idle for more than idle_seconds
 
-    def length
-        @max - @created + @que.length
+  def idle_connections?(idle_seconds, reap_start_time)
+    if connection_stored?
+      _conn, last_checked_out = @que.first
+      reap_start_time - last_checked_out > idle_seconds
     end
+  end
 
-    private
+  ##
+  # This is an extension point for TimedStack and is called with a mutex.
+  #
+  # This method must return +obj+ to the stack.
 
-    def current_time
-        Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end
+  def store_connection(obj, options = nil)
+    @que.push [obj, current_time]
+  end
 
-    ##
-    # This is an extension point for TimedStack and is called with a mutex.
-    #
-    # This method must returns true if a connection is available on the stack.
+  ##
+  # This is an extension point for TimedStack and is called with a mutex.
+  #
+  # This method must create a connection if and only if the total number of
+  # connections allowed has not been met.
 
-    def connection_stored?(options = nil)
-        !@que.empty?
-    end
-
-    ##
-    # This is an extension point for TimedStack and is called with a mutex.
-    #
-    # This method must return a connection from the stack.
-
-    def fetch_connection(options = nil)
-        @que.pop
-    end
-
-    ##
-    # This is an extension point for TimedStack and is called with a mutex.
-    #
-    # This method must shut down all connections on the stack.
-
-    def shutdown_connections(options = nil)
-        while connection_stored?(options)
-            conn = fetch_connection(options)
-            @shutdown_block.call(conn)
-        end
-        @created = 0
-    end
-
-    ##
-    # This is an extension point for TimedStack and is called with a mutex.
-    #
-    # This method must return +obj+ to the stack.
-
-    def store_connection(obj, options = nil)
-        @que.push obj
+  def try_create(options = nil)
+    unless @created == @max
+      object = @create_block.call
+      @created += 1
+      object
     end
 end
