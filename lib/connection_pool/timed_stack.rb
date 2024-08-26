@@ -24,14 +24,30 @@ class ConnectionPool::TimedStack
     # Creates a new pool with +size+ connections that are created from the given
     # +block+.
 
-    def initialize(size = 0, &block)
-        @create_block = block
-        @created = 0
-        @que = []
-        @max = size
-        @mutex = Thread::Mutex.new
-        @resource = Thread::ConditionVariable.new
-        @shutdown_block = nil
+  def initialize(size = 0, &block)
+    @create_block = block
+    @created = 0
+    @que = []
+    @max = size
+    @mutex = Thread::Mutex.new
+    @resource = Thread::ConditionVariable.new
+    @shutdown_block = nil
+  end
+
+  ##
+  # Returns +obj+ to the stack.  +options+ is ignored in TimedStack but may be
+  # used by subclasses that extend TimedStack.
+
+  def push(obj, options = {})
+    @mutex.synchronize do
+      if @shutdown_block
+        @created -= 1 unless @created == 0
+        @shutdown_block.call(obj)
+      else
+        store_connection obj, options
+      end
+
+      @resource.broadcast
     end
 
     ##
@@ -180,8 +196,10 @@ class ConnectionPool::TimedStack
   def shutdown_connections(options = nil)
     while connection_stored?(options)
       conn = fetch_connection(options)
+      @created -= 1 unless @created == 0
       @shutdown_block.call(conn)
     end
+  end
 
   ##
   # This is an extension point for TimedStack and is called with a mutex.
@@ -192,8 +210,7 @@ class ConnectionPool::TimedStack
   def reserve_idle_connection(idle_seconds)
     return unless idle_connections?(idle_seconds)
 
-    # Decrement created unless this is a no create stack
-    @created -= 1 unless @max == 0
+    @created -= 1 unless @created == 0
 
     @que.shift.first
   end
