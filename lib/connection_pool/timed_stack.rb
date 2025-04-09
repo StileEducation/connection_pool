@@ -18,11 +18,11 @@
 #    #=> raises ConnectionPool::TimeoutError after 5 seconds
 
 class ConnectionPool::TimedStack
-    attr_reader :max
+  attr_reader :max
 
-    ##
-    # Creates a new pool with +size+ connections that are created from the given
-    # +block+.
+  ##
+  # Creates a new pool with +size+ connections that are created from the given
+  # +block+.
 
   def initialize(size = 0, &block)
     @create_block = block
@@ -49,80 +49,78 @@ class ConnectionPool::TimedStack
 
       @resource.broadcast
     end
+  end
+  alias_method :<<, :push
 
-    ##
-    # Returns +obj+ to the stack.  +options+ is ignored in TimedStack but may be
-    # used by subclasses that extend TimedStack.
+  ##
+  # Retrieves a connection from the stack.  If a connection is available it is
+  # immediately returned.  If no connection is available within the given
+  # timeout a ConnectionPool::TimeoutError is raised.
+  #
+  # +:timeout+ is the only checked entry in +options+ and is preferred over
+  # the +timeout+ argument (which will be removed in a future release).  Other
+  # options may be used by subclasses that extend TimedStack.
 
-    def push(obj, options = {})
-        @mutex.synchronize do
-            if @shutdown_block
-                @shutdown_block.call(obj)
-            else
-                store_connection obj, options
-            end
+  def pop(timeout = 0.5, options = {})
+    options, timeout = timeout, 0.5 if Hash === timeout
+    timeout = options.fetch :timeout, timeout
 
-            @resource.broadcast
+    deadline = current_time + timeout
+    loop do
+      create_new = @mutex.synchronize do
+        # Try taking an existing connection
+        raise ConnectionPool::PoolShuttingDownError if @shutdown_block
+        return fetch_connection(options) if connection_stored?(options)
+
+        # Check if we can make a new connection and if so, optimistically increment the
+        # connection count to lock that connection slot
+        unless @created == @max
+          @created += 1
+          true
         end
+      end
+
+      # If we've decided to make a new connection
+      if create_new
+          begin
+              # Create a new connection without the mutex and yield it
+              return @create_block.call
+          rescue StandardError
+              # Something went wrong while making a connection; revert our optimistic increment to the
+              # connection counter
+              @mutex.synchronize { @created -= 1 }
+
+              # Then re-raise so that the caller can see the connection creation error
+              raise
+          end
+      end
+      # Wait for a connection to be returned to the pool
+      @mutex.synchronize do
+        to_wait = deadline - current_time
+        raise ConnectionPool::TimeoutError, "Waited #{timeout} sec, #{length}/#{@max} available" if to_wait <= 0
+        @resource.wait(@mutex, to_wait)
+      end
+
     end
-    alias_method :<<, :push
+  end
 
-    ##
-    # Retrieves a connection from the stack.  If a connection is available it is
-    # immediately returned.  If no connection is available within the given
-    # timeout a ConnectionPool::TimeoutError is raised.
-    #
-    # +:timeout+ is the only checked entry in +options+ and is preferred over
-    # the +timeout+ argument (which will be removed in a future release).  Other
-    # options may be used by subclasses that extend TimedStack.
+  ##
+  # Shuts down the TimedStack by passing each connection to +block+ and then
+  # removing it from the pool. Attempting to checkout a connection after
+  # shutdown will raise +ConnectionPool::PoolShuttingDownError+ unless
+  # +:reload+ is +true+.
 
-    def pop(timeout = 0.5, options = {})
-        options, timeout = timeout, 0.5 if Hash === timeout
-        timeout = options.fetch :timeout, timeout
+  def shutdown(reload: false, &block)
+    raise ArgumentError, "shutdown must receive a block" unless block
 
-        deadline = current_time + timeout
+    @mutex.synchronize do
+      @shutdown_block = block
+      @resource.broadcast
 
-        loop do
-            create_new =
-                @mutex.synchronize do
-                    # Try taking an existing connection
-                    raise ConnectionPool::PoolShuttingDownError if @shutdown_block
-                    return fetch_connection(options) if connection_stored?(options)
-
-                    # Check if we can make a new connection and if so, optimistically increment the
-                    # connection count to lock that connection slot
-                    unless @created == @max
-                        @created += 1
-                        true
-                    end
-                end
-
-            # If we've decided to make a new connection
-            if create_new
-                begin
-                    # Create a new connection without the mutex and yield it
-                    return @create_block.call
-                rescue StandardError
-                    # Something went wrong while making a connection; revert our optimistic increment to the
-                    # connection counter
-                    @mutex.synchronize { @created -= 1 }
-
-                    # Then re-raise so that the caller can see the connection creation error
-                    raise
-                end
-            end
-
-            # Wait for a connection to be returned to the pool
-            @mutex.synchronize do
-                to_wait = deadline - current_time
-                if to_wait <= 0
-                    raise ConnectionPool::TimeoutError,
-                                "Waited #{timeout} sec, #{length}/#{@max} available"
-                end
-                @resource.wait(@mutex, to_wait)
-            end
-        end
+      shutdown_connections
+      @shutdown_block = nil if reload
     end
+  end
 
   ##
   # Reaps connections that were checked in more than +idle_seconds+ ago.
@@ -147,12 +145,12 @@ class ConnectionPool::TimedStack
   ##
   # Returns +true+ if there are no available connections.
 
-    def shutdown(reload: false, &block)
-        raise ArgumentError, 'shutdown must receive a block' unless block
+  def empty?
+    (@created - @que.length) >= @max
+  end
 
-        @mutex.synchronize do
-            @shutdown_block = block
-            @resource.broadcast
+  ##
+  # The number of connections available on the stack.
 
   def length
     @max - @created + @que.length
@@ -233,16 +231,4 @@ class ConnectionPool::TimedStack
     @que.push [obj, current_time]
   end
 
-  ##
-  # This is an extension point for TimedStack and is called with a mutex.
-  #
-  # This method must create a connection if and only if the total number of
-  # connections allowed has not been met.
-
-  def try_create(options = nil)
-    unless @created == @max
-      object = @create_block.call
-      @created += 1
-      object
-    end
 end
